@@ -1,0 +1,25 @@
+# kiosks.yaml — kiosk-controller kiosk definitions
+# Copy to /etc/kiosk-controller/kiosks.yaml on the host
+#
+# ssh_password_env: name of an env var that holds the SSH password.
+# The env var value is read at request time from the running process environment.
+# Pass it via the systemd EnvironmentFile (e.g. /etc/kiosk-controller/env).
+
+kiosks:
+  wallach:
+    # Loft Operator kiosk (Raspberry Pi 4, 7" display)
+    # Ethernet IP when docked: 192.168.2.114
+    # Wi-Fi IP when in loft: 192.168.3.31  (update when moved)
+    ip: 192.168.2.114
+    ssh_user: damon
+    ssh_password_env: WALLACH_SSH_PASSWORD
+    devtools_port: 9222
+
+  # kitchen:
+  #   ip: 192.168.2.xxx
+  #   ssh_user: damon
+  #   ssh_password_env: KITCHEN_SSH_PASSWORD
+  #   devtools_port: 9222
+  #   # NOTE: kitchen uses Fully Kiosk Browser which has its own REST API.
+  #   # The SSH+DevTools path does NOT apply there. See homelab-infra#163
+  #   # "Future work" section for the Fully Kiosk REST endpoint pattern.
