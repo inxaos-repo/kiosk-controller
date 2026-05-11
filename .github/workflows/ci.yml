@@ -17,10 +17,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
-        run: pip install aiohttp asyncssh PyYAML
+        run: pip install aiohttp asyncssh PyYAML pytest pytest-asyncio pytest-aiohttp
 
       - name: Syntax check
         run: python -c "import kiosk_controller.main; print('OK')"
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
 
   docker:
     runs-on: ubuntu-latest

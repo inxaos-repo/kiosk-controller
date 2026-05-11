@@ -29,12 +29,24 @@ Wallach kiosk (192.168.2.114)
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/healthz` | Daemon health (no auth) |
-| POST | `/kiosk-reload/<name>` | Reload current page |
-| POST | `/kiosk-show/<name>?url=<url>` | Navigate to URL |
+| POST | `/kiosk-reload/<name>` | Reload current page (preserve URL) |
+| POST | `/kiosk-reset/<name>` | Navigate to the kiosk's canonical `kiosk_url` |
+| POST | `/kiosk-show/<name>?url=<url>` | Navigate to an arbitrary URL (admin) |
+| POST | `/kiosk-show-alias/<name>/<alias>` | Navigate to a named dashboard alias |
 | GET | `/kiosk-status/<name>` | Current tab URL + title |
 | GET | `/metrics` | Prometheus counters |
 
 All endpoints except `/healthz` require `Authorization: Bearer <token>`.
+
+### Sticky-until-sleep navigation
+
+The `/kiosk-show-alias` + `/kiosk-reset` pair implements a "sticky-until-sleep" UX:
+
+1. User asks for a non-default dashboard → caller hits `POST /kiosk-show-alias/<name>/<alias>`. The kiosk navigates and stays put.
+2. The kiosk stays on the chosen dashboard indefinitely — incidental motion events do not snap it back.
+3. When the kiosk has been idle long enough that motion-wake fires (the "screen sleep → wake" event), HA's motion-wake automation calls `POST /kiosk-reset/<name>` instead of `/kiosk-reload`. The kiosk reverts to `kiosk_url`.
+
+The daemon does not track "is the kiosk awake right now" itself — that's HA's job. The daemon just exposes the two verbs and lets HA decide when to invoke each.
 
 ## Configuration
 
@@ -43,11 +55,24 @@ All endpoints except `/healthz` require `Authorization: Bearer <token>`.
 ```yaml
 kiosks:
   wallach:
-    ip: 192.168.2.114        # or 192.168.3.31 (Wi-Fi)
+    ip: 192.168.3.91
     ssh_user: damon
     ssh_password_env: WALLACH_SSH_PASSWORD   # name of env var holding the password
     devtools_port: 9222
+
+    # NEW (2026-05): canonical URL for /kiosk-reset (the "home" state).
+    # Optional; if absent, /kiosk-reset returns 400.
+    kiosk_url: "https://loft-dashboard.k8s.inxaos.com"
+
+    # NEW (2026-05): allowlisted dashboard aliases for /kiosk-show-alias.
+    # Optional; if absent, /kiosk-show-alias returns 400.
+    dashboards:
+      home: "https://loft-dashboard.k8s.inxaos.com"
+      wallach: "https://grafana.k8s.inxaos.com/d/wallach-kiosk?kiosk&refresh=30s"
+      ginaz: "https://grafana.k8s.inxaos.com/d/ginaz-bare-metal?kiosk&refresh=30s"
 ```
+
+Both `kiosk_url:` and `dashboards:` are optional and **backward-compatible** — existing kiosks without them keep working; only the new routes return 400 for those kiosks.
 
 See `kiosks.yaml.example` for a full annotated example.
 
