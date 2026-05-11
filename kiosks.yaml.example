@@ -7,13 +7,30 @@
 
 kiosks:
   wallach:
-    # Loft Operator kiosk (Raspberry Pi 4, 7" display)
-    # Ethernet IP when docked: 192.168.2.114
-    # Wi-Fi IP when in loft: 192.168.3.31  (update when moved)
-    ip: 192.168.2.114
+    # Loft Operator kiosk (Raspberry Pi 5, 2GB, 24" LG monitor)
+    # IP via T3U USB Wi-Fi dongle on inxaos-iot SSID (VLAN 61)
+    ip: 192.168.3.91
     ssh_user: damon
     ssh_password_env: WALLACH_SSH_PASSWORD
     devtools_port: 9222
+
+    # Canonical URL for /kiosk-reset (the "home" state). Used by HA's
+    # motion-wake automation to revert the kiosk after sleep.
+    kiosk_url: "https://loft-dashboard.k8s.inxaos.com"
+
+    # Allowlisted dashboard aliases for /kiosk-show-alias. Each entry maps
+    # an alias name to a full URL the kiosk will navigate to. The list of
+    # available aliases is surfaced in 404 responses when an unknown alias
+    # is requested.
+    dashboards:
+      home: "https://loft-dashboard.k8s.inxaos.com"
+      wallach: "https://grafana.k8s.inxaos.com/d/wallach-kiosk?kiosk&refresh=30s"
+      ginaz: "https://grafana.k8s.inxaos.com/d/ginaz-bare-metal?kiosk&refresh=30s"
+      command-center: "https://grafana.k8s.inxaos.com/d/homelab-command-center?kiosk&refresh=30s"
+      energy: "https://grafana.k8s.inxaos.com/d/energy-monitoring?kiosk&refresh=30s"
+      weather: "https://grafana.k8s.inxaos.com/d/smart-home-weather?kiosk&refresh=30s"
+      network: "https://grafana.k8s.inxaos.com/d/network-traffic?kiosk&refresh=30s"
+      certs: "https://grafana.k8s.inxaos.com/d/certs-ingress?kiosk&refresh=30s"
 
   # kitchen:
   #   ip: 192.168.2.xxx

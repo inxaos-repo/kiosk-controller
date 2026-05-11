@@ -5,10 +5,12 @@ Listens on 0.0.0.0:18080 by default.
 Reads kiosk definitions from /etc/kiosk-controller/kiosks.yaml.
 
 Endpoints:
-  POST /kiosk-reload/<name>          — reload current page (Ctrl+R via DevTools)
-  POST /kiosk-show/<name>?url=<url>  — navigate to a URL
-  GET  /kiosk-status/<name>          — current tab URL + last-active timestamp
-  GET  /healthz                      — daemon health
+  POST /kiosk-reload/<name>                  — reload current page (Ctrl+R via DevTools)
+  POST /kiosk-reset/<name>                   — navigate to the kiosk's canonical kiosk_url
+  POST /kiosk-show/<name>?url=<url>          — navigate to an arbitrary URL (admin)
+  POST /kiosk-show-alias/<name>/<alias>      — navigate to a named dashboard alias
+  GET  /kiosk-status/<name>                  — current tab URL + last-active timestamp
+  GET  /healthz                              — daemon health
 
 Authentication: Bearer token via KIOSK_CONTROLLER_TOKEN env var.
 
@@ -222,17 +224,26 @@ async def handle_reload(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
 
 
-async def handle_show(request: web.Request) -> web.Response:
-    name = request.match_info["name"]
-    target_url = request.rel_url.query.get("url", "")
-    if not target_url:
-        return web.json_response({"error": "?url= parameter required"}, status=400)
+def resolve_alias(kiosk: dict[str, Any], alias: str) -> tuple[str | None, list[str]]:
+    """Look up an alias in the kiosk's dashboards map.
 
-    kiosk = get_kiosk(name)
-    if not kiosk:
-        return web.json_response({"error": f"unknown kiosk: {name}"}, status=404)
+    Returns (url, available_aliases). url is None if the alias is missing.
+    available_aliases is always populated (may be empty list).
 
-    log.info("show request for kiosk=%s url=%s", name, target_url)
+    Pure function — no I/O, easy to unit test.
+    """
+    dashboards = kiosk.get("dashboards") or {}
+    available = sorted(dashboards.keys())
+    return dashboards.get(alias), available
+
+
+async def _navigate_kiosk(kiosk: dict[str, Any], name: str, target_url: str) -> web.Response:
+    """Shared navigation plumbing: DevTools list -> WS -> Page.navigate.
+
+    Used by /kiosk-show, /kiosk-reset, and /kiosk-show-alias to avoid duplication.
+    Returns the final JSON response (success or error). Callers add their own
+    response fields by wrapping this in their handler.
+    """
     try:
         tabs_raw = await _ssh_get(kiosk, "/json/list")
         tabs = json.loads(tabs_raw)
@@ -263,6 +274,92 @@ async def handle_show(request: web.Request) -> web.Response:
     except Exception as e:  # pylint: disable=broad-except
         log.exception("Unexpected error for kiosk=%s", name)
         return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_show(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    target_url = request.rel_url.query.get("url", "")
+    if not target_url:
+        return web.json_response({"error": "?url= parameter required"}, status=400)
+
+    kiosk = get_kiosk(name)
+    if not kiosk:
+        return web.json_response({"error": f"unknown kiosk: {name}"}, status=404)
+
+    log.info("show request for kiosk=%s url=%s", name, target_url)
+    return await _navigate_kiosk(kiosk, name, target_url)
+
+
+async def handle_reset(request: web.Request) -> web.Response:
+    """Navigate to the kiosk's canonical kiosk_url (the 'home' state).
+
+    Intended to be called by HA's motion-wake automation after a sleep
+    period — supports the 'sticky-until-sleep' UX where a user-chosen
+    dashboard persists until the kiosk goes idle and wakes.
+    """
+    name = request.match_info["name"]
+    kiosk = get_kiosk(name)
+    if not kiosk:
+        return web.json_response({"error": f"unknown kiosk: {name}"}, status=404)
+
+    target_url = kiosk.get("kiosk_url")
+    if not target_url:
+        return web.json_response(
+            {"error": f"kiosk has no kiosk_url configured", "kiosk": name},
+            status=400,
+        )
+
+    log.info("reset request for kiosk=%s canonical_url=%s", name, target_url)
+    resp = await _navigate_kiosk(kiosk, name, target_url)
+    # If the navigation succeeded, augment the response with reset=True
+    if resp.status == 200:
+        body = json.loads(resp.body)
+        body["reset"] = True
+        return web.json_response(body)
+    return resp
+
+
+async def handle_show_alias(request: web.Request) -> web.Response:
+    """Navigate to a named dashboard alias.
+
+    Aliases are defined per-kiosk in the dashboards: block of kiosks.yaml.
+    Returns 404 (with the list of available aliases) if the alias is missing,
+    400 if the kiosk has no dashboards: block at all.
+    """
+    name = request.match_info["name"]
+    alias = request.match_info["alias"]
+
+    kiosk = get_kiosk(name)
+    if not kiosk:
+        return web.json_response({"error": f"unknown kiosk: {name}"}, status=404)
+
+    dashboards = kiosk.get("dashboards")
+    if not dashboards:
+        return web.json_response(
+            {"error": "kiosk has no dashboards configured", "kiosk": name},
+            status=400,
+        )
+
+    target_url, available = resolve_alias(kiosk, alias)
+    if target_url is None:
+        return web.json_response(
+            {
+                "error": "unknown alias",
+                "alias": alias,
+                "kiosk": name,
+                "available": available,
+            },
+            status=404,
+        )
+
+    log.info("show-alias request for kiosk=%s alias=%s url=%s", name, alias, target_url)
+    resp = await _navigate_kiosk(kiosk, name, target_url)
+    # If the navigation succeeded, augment the response with the alias name
+    if resp.status == 200:
+        body = json.loads(resp.body)
+        body["alias"] = alias
+        return web.json_response(body)
+    return resp
 
 
 async def handle_status(request: web.Request) -> web.Response:
@@ -317,7 +414,9 @@ def create_app() -> web.Application:
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_get("/healthz", handle_healthz)
     app.router.add_post("/kiosk-reload/{name}", handle_reload)
+    app.router.add_post("/kiosk-reset/{name}", handle_reset)
     app.router.add_post("/kiosk-show/{name}", handle_show)
+    app.router.add_post("/kiosk-show-alias/{name}/{alias}", handle_show_alias)
     app.router.add_get("/kiosk-status/{name}", handle_status)
     app.router.add_get("/metrics", handle_metrics)
     return app
