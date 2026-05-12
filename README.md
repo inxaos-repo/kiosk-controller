@@ -33,8 +33,8 @@ Wallach kiosk (192.168.2.114)
 | POST | `/kiosk-reset/<name>` | Navigate to the kiosk's canonical `kiosk_url` |
 | POST | `/kiosk-show/<name>?url=<url>` | Navigate to an arbitrary URL (admin) |
 | POST | `/kiosk-show-alias/<name>/<alias>` | Navigate to a named dashboard alias |
-| POST | `/kiosk-sleep/<name>` | Turn screen **off** via `wlopm --off '*'` |
-| POST | `/kiosk-wake/<name>` | Turn screen **on** via `wlopm --on '*'` |
+| POST | `/kiosk-sleep/<name>` | Turn screen **off** via `wlr-randr ... --off` |
+| POST | `/kiosk-wake/<name>` | Turn screen **on** via `wlr-randr ... --on` |
 | GET | `/kiosk-status/<name>` | Current tab URL + title |
 | GET | `/metrics` | Prometheus counters |
 
@@ -42,15 +42,29 @@ All endpoints except `/healthz` require `Authorization: Bearer <token>`.
 
 ### Sleep + wake (HA-driven)
 
-The `/kiosk-sleep` + `/kiosk-wake` pair implements real screen-off / screen-on via `wlopm` (the [wlroots-output-power-management-v1](https://wayland.app/protocols/wlr-output-power-management-unstable-v1) CLI). HA decides when:
+The `/kiosk-sleep` + `/kiosk-wake` pair implements real screen-off / screen-on via `wlr-randr` (the [`wlr-output-management-v1`](https://wayland.app/protocols/wlr-output-management-unstable-v1) CLI). HA decides when:
 
-1. **Sleep:** HA's `wallach_kiosk_sleep_on_loft_idle_*` automation fires when the loft motion sensor has been off for ≥ 15 min → `POST /kiosk-sleep/<name>` → the daemon SSHes in and runs `wlopm --off '*'` → HDMI output goes to standby → monitor sleeps.
-2. **Wake:** HA's `wallach_kiosk_motion_wake_*` automation fires on any loft motion → `POST /kiosk-wake/<name>` → the daemon SSHes in and runs `wlopm --on '*'` → monitor wakes back up.
+1. **Sleep:** HA's `wallach_kiosk_sleep_on_loft_idle_*` automation fires when the loft motion sensor has been off for ≥ 15 min → `POST /kiosk-sleep/<name>` → the daemon SSHes in and runs `wlr-randr --output <name> --off` for each enabled output → HDMI output goes to standby → monitor sleeps.
+2. **Wake:** HA's `wallach_kiosk_motion_wake_*` automation fires on any loft motion → `POST /kiosk-wake/<name>` → the daemon SSHes in and runs `wlr-randr --output <name> --on` for each output → monitor wakes back up.
 3. **Dashboard state preserved.** Wake does NOT change the URL — whatever was on screen at sleep time is what shows on wake. If you want "go home," call `/kiosk-reset/<name>` explicitly.
 
 The daemon does not track "is the kiosk awake right now" — that's HA's job. The daemon just exposes the two verbs.
 
-**Requires `wlopm` installed on the kiosk** — handled by the `kiosk-pi` Ansible role in [inxaos-repo/homelab-infra](https://github.com/inxaos-repo/homelab-infra). The `wlopm` package ships in Debian Trixie main for arm64 (v0.1.0).
+**Requires `wlr-randr` installed on the kiosk** — handled by the `kiosk-pi` Ansible role in [inxaos-repo/homelab-infra](https://github.com/inxaos-repo/homelab-infra). The `wlr-randr` package ships in Debian Trixie main for arm64 (v0.4.1).
+
+#### Why `wlr-randr` and not `wlopm`?
+
+The obvious choice for "turn the screen off" on a wlroots compositor is `wlopm`, which uses the [`wlr-output-power-management-v1`](https://wayland.app/protocols/wlr-output-power-management-unstable-v1) protocol. But cage 0.2.0 (Debian Trixie's packaged version) implements only the related but separate `wlr-output-management-v1` protocol — wlopm fails with:
+
+```
+ERROR: Wayland server does not support wlr-output-power-management-v1.
+```
+
+`wlr-randr` uses `wlr-output-management-v1` and works on cage 0.2.0. The functional end result is the same — DRM connector flips to `Off / disabled` and the monitor enters DPMS standby. When cage gets upgraded to a version that supports `wlr-output-power-management-v1`, `wlopm` becomes a viable alternative, but it's not needed.
+
+#### Multi-monitor kiosks
+
+For kiosks with multiple outputs where you only want to control one (e.g. keep an admin status display always on while sleeping the user-facing monitor), the future shape is a per-kiosk `wlr_output` field in `kiosks.yaml`. Not implemented yet — today the iteration controls every output the compositor knows about, which is correct for single-monitor kiosks (the only kind we have).
 
 ### Show-Me Dashboard X (alias navigation)
 
