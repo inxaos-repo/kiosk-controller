@@ -33,20 +33,30 @@ Wallach kiosk (192.168.2.114)
 | POST | `/kiosk-reset/<name>` | Navigate to the kiosk's canonical `kiosk_url` |
 | POST | `/kiosk-show/<name>?url=<url>` | Navigate to an arbitrary URL (admin) |
 | POST | `/kiosk-show-alias/<name>/<alias>` | Navigate to a named dashboard alias |
+| POST | `/kiosk-sleep/<name>` | Turn screen **off** via `wlopm --off '*'` |
+| POST | `/kiosk-wake/<name>` | Turn screen **on** via `wlopm --on '*'` |
 | GET | `/kiosk-status/<name>` | Current tab URL + title |
 | GET | `/metrics` | Prometheus counters |
 
 All endpoints except `/healthz` require `Authorization: Bearer <token>`.
 
-### Sticky-until-sleep navigation
+### Sleep + wake (HA-driven)
 
-The `/kiosk-show-alias` + `/kiosk-reset` pair implements a "sticky-until-sleep" UX:
+The `/kiosk-sleep` + `/kiosk-wake` pair implements real screen-off / screen-on via `wlopm` (the [wlroots-output-power-management-v1](https://wayland.app/protocols/wlr-output-power-management-unstable-v1) CLI). HA decides when:
 
-1. User asks for a non-default dashboard → caller hits `POST /kiosk-show-alias/<name>/<alias>`. The kiosk navigates and stays put.
-2. The kiosk stays on the chosen dashboard indefinitely — incidental motion events do not snap it back.
-3. When the kiosk has been idle long enough that motion-wake fires (the "screen sleep → wake" event), HA's motion-wake automation calls `POST /kiosk-reset/<name>` instead of `/kiosk-reload`. The kiosk reverts to `kiosk_url`.
+1. **Sleep:** HA's `wallach_kiosk_sleep_on_loft_idle_*` automation fires when the loft motion sensor has been off for ≥ 15 min → `POST /kiosk-sleep/<name>` → the daemon SSHes in and runs `wlopm --off '*'` → HDMI output goes to standby → monitor sleeps.
+2. **Wake:** HA's `wallach_kiosk_motion_wake_*` automation fires on any loft motion → `POST /kiosk-wake/<name>` → the daemon SSHes in and runs `wlopm --on '*'` → monitor wakes back up.
+3. **Dashboard state preserved.** Wake does NOT change the URL — whatever was on screen at sleep time is what shows on wake. If you want "go home," call `/kiosk-reset/<name>` explicitly.
 
-The daemon does not track "is the kiosk awake right now" itself — that's HA's job. The daemon just exposes the two verbs and lets HA decide when to invoke each.
+The daemon does not track "is the kiosk awake right now" — that's HA's job. The daemon just exposes the two verbs.
+
+**Requires `wlopm` installed on the kiosk** — handled by the `kiosk-pi` Ansible role in [inxaos-repo/homelab-infra](https://github.com/inxaos-repo/homelab-infra). The `wlopm` package ships in Debian Trixie main for arm64 (v0.1.0).
+
+### Show-Me Dashboard X (alias navigation)
+
+The `/kiosk-show-alias` route lets HA / Bob / future voice intents navigate the kiosk to a named dashboard from a per-kiosk allowlist. Aliases are defined in `kiosks.yaml`. See the [`kiosks.yaml.example`](./kiosks.yaml.example) for shape.
+
+A chosen alias **persists indefinitely** until something explicit changes it (`/kiosk-reset` for canonical home, or another `/kiosk-show-alias` for a different dashboard). Sleep + wake do not change the URL. `/kiosk-reset` is now never auto-fired — it's an explicit "go home" verb.
 
 ## Configuration
 
