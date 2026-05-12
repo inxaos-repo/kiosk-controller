@@ -9,8 +9,8 @@ Endpoints:
   POST /kiosk-reset/<name>                   — navigate to the kiosk's canonical kiosk_url
   POST /kiosk-show/<name>?url=<url>          — navigate to an arbitrary URL (admin)
   POST /kiosk-show-alias/<name>/<alias>      — navigate to a named dashboard alias
-  POST /kiosk-sleep/<name>                   — turn screen OFF via wlopm (Wayland DPMS)
-  POST /kiosk-wake/<name>                    — turn screen ON via wlopm (Wayland DPMS)
+  POST /kiosk-sleep/<name>                   — turn screen OFF via wlr-randr (Wayland DPMS)
+  POST /kiosk-wake/<name>                    — turn screen ON via wlr-randr (Wayland DPMS)
   GET  /kiosk-status/<name>                  — current tab URL + last-active timestamp
   GET  /healthz                              — daemon health
 
@@ -124,12 +124,39 @@ async def _ssh_get(kiosk: dict[str, Any], path: str) -> bytes:
         return result.stdout.encode() if isinstance(result.stdout, str) else result.stdout
 
 
+# ---------------------------------------------------------------------------
+# Sleep/wake commands (wlr-randr based)
+# ---------------------------------------------------------------------------
+# Cage 0.2.0 (Trixie's packaged version) implements wlr-output-management-v1 but
+# NOT wlr-output-power-management-v1, so we use wlr-randr (which uses the former
+# protocol) instead of wlopm (which uses the latter).
+#
+# wlr-randr doesn't have wlopm's '*' wildcard for "all outputs," so we iterate:
+# for sleep, list every enabled output and turn it off; for wake, list every
+# output (enabled or not) and turn it on. Idempotent on either side: turning
+# an already-off output off is a no-op, and same for on.
+#
+# For kiosks with multiple monitors where only ONE should be controlled, the
+# future shape is a per-kiosk `wlr_output` field in kiosks.yaml. Not implemented
+# in this version — single-monitor kiosks (the only kind we have today) are
+# handled correctly by the iteration.
+SLEEP_COMMAND = (
+    "wlr-randr | awk '/^[A-Z]/ {output=$1} /Enabled: yes/ {print output}' "
+    "| xargs -r -I{} wlr-randr --output {} --off"
+)
+WAKE_COMMAND = (
+    "wlr-randr | awk '/^[A-Z]/ {print $1}' "
+    "| xargs -r -I{} wlr-randr --output {} --on"
+)
+
+
 async def _ssh_exec(kiosk: dict[str, Any], command: str) -> tuple[int, str, str]:
     """Run an arbitrary command over SSH and return (exit_status, stdout, stderr).
 
-    Used by /kiosk-sleep + /kiosk-wake to invoke wlopm directly. wlopm needs the
-    Wayland session env to find the compositor's socket; we set XDG_RUNTIME_DIR
-    and WAYLAND_DISPLAY explicitly so the command works in a non-interactive SSH.
+    Used by /kiosk-sleep + /kiosk-wake to invoke wlr-randr directly. wlr-randr
+    needs the Wayland session env to find the compositor's socket; we set
+    XDG_RUNTIME_DIR and WAYLAND_DISPLAY explicitly so the command works in a
+    non-interactive SSH.
     """
     ip = kiosk["ip"]
     user = kiosk.get("ssh_user", "damon")
@@ -144,7 +171,7 @@ async def _ssh_exec(kiosk: dict[str, Any], command: str) -> tuple[int, str, str]
         connect_kwargs["password"] = password
         connect_kwargs["preferred_auth"] = "password"
 
-    # Wrap the command so wlopm / wayland tools find the compositor.
+    # Wrap the command so wlr-randr / wayland tools find the compositor.
     # `id -u` gives the user's UID, which is where systemd puts the runtime dir.
     wrapped = (
         "export XDG_RUNTIME_DIR=\"/run/user/$(id -u)\"; "
@@ -400,12 +427,11 @@ async def handle_show_alias(request: web.Request) -> web.Response:
 
 
 async def handle_sleep(request: web.Request) -> web.Response:
-    """Turn the kiosk's screen OFF via `wlopm --off '*'`.
+    """Turn the kiosk's screen OFF via `wlr-randr ... --off`.
 
     Intended to be called by HA's loft-idle automation after >=15 min of no
     motion. Pairs with /kiosk-wake (called by the motion-wake automation).
-    Idempotent — running on an already-off screen is a no-op at the
-    wlroots-output-power-management protocol level.
+    Idempotent — running on an already-off screen is a no-op.
     """
     name = request.match_info["name"]
     kiosk = get_kiosk(name)
@@ -414,15 +440,15 @@ async def handle_sleep(request: web.Request) -> web.Response:
 
     log.info("sleep request for kiosk=%s", name)
     try:
-        exit_status, stdout, stderr = await _ssh_exec(kiosk, "wlopm --off '*'")
+        exit_status, stdout, stderr = await _ssh_exec(kiosk, SLEEP_COMMAND)
         if exit_status != 0:
             log.error(
-                "wlopm --off failed for kiosk=%s exit=%d stderr=%s",
+                "wlr-randr --off failed for kiosk=%s exit=%d stderr=%s",
                 name, exit_status, stderr.strip(),
             )
             return web.json_response(
                 {
-                    "error": f"wlopm --off failed (exit {exit_status})",
+                    "error": f"wlr-randr --off failed (exit {exit_status})",
                     "stderr": stderr.strip(),
                     "kiosk": name,
                 },
@@ -443,7 +469,7 @@ async def handle_sleep(request: web.Request) -> web.Response:
 
 
 async def handle_wake(request: web.Request) -> web.Response:
-    """Turn the kiosk's screen ON via `wlopm --on '*'`.
+    """Turn the kiosk's screen ON via `wlr-randr ... --on`.
 
     Intended to be called by HA's motion-wake automation. Preserves whatever
     dashboard was showing before the kiosk slept — does NOT reset to canonical.
@@ -456,15 +482,15 @@ async def handle_wake(request: web.Request) -> web.Response:
 
     log.info("wake request for kiosk=%s", name)
     try:
-        exit_status, stdout, stderr = await _ssh_exec(kiosk, "wlopm --on '*'")
+        exit_status, stdout, stderr = await _ssh_exec(kiosk, WAKE_COMMAND)
         if exit_status != 0:
             log.error(
-                "wlopm --on failed for kiosk=%s exit=%d stderr=%s",
+                "wlr-randr --on failed for kiosk=%s exit=%d stderr=%s",
                 name, exit_status, stderr.strip(),
             )
             return web.json_response(
                 {
-                    "error": f"wlopm --on failed (exit {exit_status})",
+                    "error": f"wlr-randr --on failed (exit {exit_status})",
                     "stderr": stderr.strip(),
                     "kiosk": name,
                 },

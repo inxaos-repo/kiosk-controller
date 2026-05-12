@@ -32,12 +32,12 @@ async def test_sleep_requires_auth(client):
     assert resp.status == 401
 
 
-async def test_sleep_wlopm_failure_returns_503(client, monkeypatch):
-    """When wlopm exits non-zero, the route returns 503 with stderr."""
+async def test_sleep_wlr_randr_failure_returns_503(client, monkeypatch):
+    """When wlr-randr exits non-zero, the route returns 503 with stderr."""
     from kiosk_controller import main as kc
 
     async def fake_ssh_exec_fail(kiosk, command):
-        return (1, "", "wlopm: failed to connect to compositor")
+        return (1, "", "wlr-randr: failed to connect to compositor")
 
     monkeypatch.setattr(kc, "_ssh_exec", fake_ssh_exec_fail)
 
@@ -47,7 +47,7 @@ async def test_sleep_wlopm_failure_returns_503(client, monkeypatch):
     )
     assert resp.status == 503
     body = await resp.json()
-    assert "wlopm --off failed" in body["error"]
+    assert "wlr-randr --off failed" in body["error"]
     assert "compositor" in body["stderr"]
     assert body["kiosk"] == "wallach"
 
@@ -81,11 +81,11 @@ async def test_wake_requires_auth(client):
     assert resp.status == 401
 
 
-async def test_wake_wlopm_failure_returns_503(client, monkeypatch):
+async def test_wake_wlr_randr_failure_returns_503(client, monkeypatch):
     from kiosk_controller import main as kc
 
     async def fake_ssh_exec_fail(kiosk, command):
-        return (1, "", "wlopm: no outputs found")
+        return (1, "", "wlr-randr: no outputs found")
 
     monkeypatch.setattr(kc, "_ssh_exec", fake_ssh_exec_fail)
 
@@ -95,7 +95,7 @@ async def test_wake_wlopm_failure_returns_503(client, monkeypatch):
     )
     assert resp.status == 503
     body = await resp.json()
-    assert "wlopm --on failed" in body["error"]
+    assert "wlr-randr --on failed" in body["error"]
     assert "no outputs" in body["stderr"]
 
 
@@ -125,7 +125,7 @@ async def test_sleep_wake_routes_registered():
 # Verify command shape passed to _ssh_exec (catches regressions if someone
 # changes the wlopm invocation by mistake)
 # -----------------------------------------------------------------------------
-async def test_sleep_passes_wlopm_off_command(client, monkeypatch):
+async def test_sleep_passes_wlr_randr_off_command(client, monkeypatch):
     from kiosk_controller import main as kc
 
     captured = {}
@@ -142,13 +142,14 @@ async def test_sleep_passes_wlopm_off_command(client, monkeypatch):
         headers={"Authorization": "Bearer test-token"},
     )
     assert resp.status == 200
-    assert "wlopm" in captured["command"]
+    assert "wlr-randr" in captured["command"]
     assert "--off" in captured["command"]
-    assert "*" in captured["command"]
+    # No wlopm-style '*' wildcard in wlr-randr commands.
+    assert "wlopm" not in captured["command"]
     assert captured["kiosk_ip"] == "192.168.3.91"
 
 
-async def test_wake_passes_wlopm_on_command(client, monkeypatch):
+async def test_wake_passes_wlr_randr_on_command(client, monkeypatch):
     from kiosk_controller import main as kc
 
     captured = {}
@@ -164,6 +165,19 @@ async def test_wake_passes_wlopm_on_command(client, monkeypatch):
         headers={"Authorization": "Bearer test-token"},
     )
     assert resp.status == 200
-    assert "wlopm" in captured["command"]
+    assert "wlr-randr" in captured["command"]
     assert "--on" in captured["command"]
-    assert "*" in captured["command"]
+    assert "wlopm" not in captured["command"]
+
+
+def test_sleep_wake_command_constants_are_defined():
+    """SLEEP_COMMAND / WAKE_COMMAND are module-level so HA / Ansible debugging
+    can introspect what's running without parsing handler source."""
+    from kiosk_controller import main as kc
+
+    assert hasattr(kc, "SLEEP_COMMAND")
+    assert hasattr(kc, "WAKE_COMMAND")
+    assert "wlr-randr" in kc.SLEEP_COMMAND
+    assert "--off" in kc.SLEEP_COMMAND
+    assert "wlr-randr" in kc.WAKE_COMMAND
+    assert "--on" in kc.WAKE_COMMAND
