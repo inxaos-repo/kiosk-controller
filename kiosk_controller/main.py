@@ -9,6 +9,8 @@ Endpoints:
   POST /kiosk-reset/<name>                   — navigate to the kiosk's canonical kiosk_url
   POST /kiosk-show/<name>?url=<url>          — navigate to an arbitrary URL (admin)
   POST /kiosk-show-alias/<name>/<alias>      — navigate to a named dashboard alias
+  POST /kiosk-sleep/<name>                   — turn screen OFF via wlopm (Wayland DPMS)
+  POST /kiosk-wake/<name>                    — turn screen ON via wlopm (Wayland DPMS)
   GET  /kiosk-status/<name>                  — current tab URL + last-active timestamp
   GET  /healthz                              — daemon health
 
@@ -120,6 +122,41 @@ async def _ssh_get(kiosk: dict[str, Any], path: str) -> bytes:
                 f"Remote curl failed (exit {result.exit_status}): {result.stderr}"
             )
         return result.stdout.encode() if isinstance(result.stdout, str) else result.stdout
+
+
+async def _ssh_exec(kiosk: dict[str, Any], command: str) -> tuple[int, str, str]:
+    """Run an arbitrary command over SSH and return (exit_status, stdout, stderr).
+
+    Used by /kiosk-sleep + /kiosk-wake to invoke wlopm directly. wlopm needs the
+    Wayland session env to find the compositor's socket; we set XDG_RUNTIME_DIR
+    and WAYLAND_DISPLAY explicitly so the command works in a non-interactive SSH.
+    """
+    ip = kiosk["ip"]
+    user = kiosk.get("ssh_user", "damon")
+    password = _resolve_password(kiosk)
+
+    connect_kwargs: dict[str, Any] = {
+        "host": ip,
+        "username": user,
+        "known_hosts": None,
+    }
+    if password:
+        connect_kwargs["password"] = password
+        connect_kwargs["preferred_auth"] = "password"
+
+    # Wrap the command so wlopm / wayland tools find the compositor.
+    # `id -u` gives the user's UID, which is where systemd puts the runtime dir.
+    wrapped = (
+        "export XDG_RUNTIME_DIR=\"/run/user/$(id -u)\"; "
+        "export WAYLAND_DISPLAY=\"${WAYLAND_DISPLAY:-wayland-0}\"; "
+        f"{command}"
+    )
+
+    async with asyncssh.connect(**connect_kwargs) as conn:
+        result = await conn.run(wrapped, check=False)
+        stdout = result.stdout if isinstance(result.stdout, str) else result.stdout.decode()
+        stderr = result.stderr if isinstance(result.stderr, str) else result.stderr.decode()
+        return result.exit_status, stdout, stderr
 
 
 async def _ssh_ws_send(kiosk: dict[str, Any], ws_url: str, message: dict) -> None:
@@ -362,6 +399,91 @@ async def handle_show_alias(request: web.Request) -> web.Response:
     return resp
 
 
+async def handle_sleep(request: web.Request) -> web.Response:
+    """Turn the kiosk's screen OFF via `wlopm --off '*'`.
+
+    Intended to be called by HA's loft-idle automation after >=15 min of no
+    motion. Pairs with /kiosk-wake (called by the motion-wake automation).
+    Idempotent — running on an already-off screen is a no-op at the
+    wlroots-output-power-management protocol level.
+    """
+    name = request.match_info["name"]
+    kiosk = get_kiosk(name)
+    if not kiosk:
+        return web.json_response({"error": f"unknown kiosk: {name}"}, status=404)
+
+    log.info("sleep request for kiosk=%s", name)
+    try:
+        exit_status, stdout, stderr = await _ssh_exec(kiosk, "wlopm --off '*'")
+        if exit_status != 0:
+            log.error(
+                "wlopm --off failed for kiosk=%s exit=%d stderr=%s",
+                name, exit_status, stderr.strip(),
+            )
+            return web.json_response(
+                {
+                    "error": f"wlopm --off failed (exit {exit_status})",
+                    "stderr": stderr.strip(),
+                    "kiosk": name,
+                },
+                status=503,
+            )
+        log.info("slept kiosk=%s", name)
+        return web.json_response({"slept": True, "kiosk": name})
+
+    except asyncssh.DisconnectError as e:
+        log.error("SSH disconnect for kiosk=%s: %s", name, e)
+        return web.json_response({"error": f"SSH error: {e}"}, status=503)
+    except (ConnectionRefusedError, OSError) as e:
+        log.error("SSH connection failed for kiosk=%s: %s", name, e)
+        return web.json_response({"error": f"SSH connection failed: {e}"}, status=503)
+    except Exception as e:  # pylint: disable=broad-except
+        log.exception("Unexpected error for kiosk=%s", name)
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_wake(request: web.Request) -> web.Response:
+    """Turn the kiosk's screen ON via `wlopm --on '*'`.
+
+    Intended to be called by HA's motion-wake automation. Preserves whatever
+    dashboard was showing before the kiosk slept — does NOT reset to canonical.
+    Idempotent — running on an already-on screen is a no-op.
+    """
+    name = request.match_info["name"]
+    kiosk = get_kiosk(name)
+    if not kiosk:
+        return web.json_response({"error": f"unknown kiosk: {name}"}, status=404)
+
+    log.info("wake request for kiosk=%s", name)
+    try:
+        exit_status, stdout, stderr = await _ssh_exec(kiosk, "wlopm --on '*'")
+        if exit_status != 0:
+            log.error(
+                "wlopm --on failed for kiosk=%s exit=%d stderr=%s",
+                name, exit_status, stderr.strip(),
+            )
+            return web.json_response(
+                {
+                    "error": f"wlopm --on failed (exit {exit_status})",
+                    "stderr": stderr.strip(),
+                    "kiosk": name,
+                },
+                status=503,
+            )
+        log.info("woke kiosk=%s", name)
+        return web.json_response({"woken": True, "kiosk": name})
+
+    except asyncssh.DisconnectError as e:
+        log.error("SSH disconnect for kiosk=%s: %s", name, e)
+        return web.json_response({"error": f"SSH error: {e}"}, status=503)
+    except (ConnectionRefusedError, OSError) as e:
+        log.error("SSH connection failed for kiosk=%s: %s", name, e)
+        return web.json_response({"error": f"SSH connection failed: {e}"}, status=503)
+    except Exception as e:  # pylint: disable=broad-except
+        log.exception("Unexpected error for kiosk=%s", name)
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def handle_status(request: web.Request) -> web.Response:
     name = request.match_info["name"]
     kiosk = get_kiosk(name)
@@ -417,6 +539,8 @@ def create_app() -> web.Application:
     app.router.add_post("/kiosk-reset/{name}", handle_reset)
     app.router.add_post("/kiosk-show/{name}", handle_show)
     app.router.add_post("/kiosk-show-alias/{name}/{alias}", handle_show_alias)
+    app.router.add_post("/kiosk-sleep/{name}", handle_sleep)
+    app.router.add_post("/kiosk-wake/{name}", handle_wake)
     app.router.add_get("/kiosk-status/{name}", handle_status)
     app.router.add_get("/metrics", handle_metrics)
     return app

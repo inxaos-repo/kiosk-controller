@@ -57,6 +57,13 @@ def app(kiosks_yaml_path, monkeypatch):
 
     monkeypatch.setattr(kc_main, "_navigate_kiosk", fake_navigate)
 
+    # Stub _ssh_exec for /kiosk-sleep + /kiosk-wake tests. Returns (0, '', '')
+    # by default — individual tests can override via monkeypatch.setattr.
+    async def fake_ssh_exec(kiosk, command):
+        return (0, "", "")
+
+    monkeypatch.setattr(kc_main, "_ssh_exec", fake_ssh_exec)
+
     return kc_main.create_app()
 
 
