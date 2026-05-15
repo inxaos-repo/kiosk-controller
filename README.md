@@ -94,9 +94,16 @@ kiosks:
       home: "https://loft-dashboard.k8s.inxaos.com"
       wallach: "https://grafana.k8s.inxaos.com/d/wallach-kiosk?kiosk&refresh=30s"
       ginaz: "https://grafana.k8s.inxaos.com/d/ginaz-bare-metal?kiosk&refresh=30s"
+
+    # NEW (2026-05): per-kiosk cooldown between /kiosk-wake or /kiosk-sleep
+    # requests. Protects the kiosk's sshd from runaway HA motion-wake
+    # automations. Failed wake attempts still consume the window. Falls back
+    # to KIOSK_WAKE_COOLDOWN_SECONDS env var (default 30s). Set to 0 to
+    # disable for this kiosk.
+    # wake_cooldown_seconds: 30
 ```
 
-Both `kiosk_url:` and `dashboards:` are optional and **backward-compatible** — existing kiosks without them keep working; only the new routes return 400 for those kiosks.
+All new fields (`kiosk_url:`, `dashboards:`, `wake_cooldown_seconds:`) are optional and **backward-compatible** — existing kiosks without them keep working; only the new routes return 400 for those kiosks.
 
 See `kiosks.yaml.example` for a full annotated example.
 
@@ -105,7 +112,13 @@ See `kiosks.yaml.example` for a full annotated example.
 ```env
 KIOSK_CONTROLLER_TOKEN=<bearer-token>
 WALLACH_SSH_PASSWORD=<ssh-password>
+
+# Optional: global cooldown (seconds) between /kiosk-wake or /kiosk-sleep
+# requests for the same kiosk. Default 30. Override per-kiosk in kiosks.yaml.
+# KIOSK_WAKE_COOLDOWN_SECONDS=30
 ```
+
+When a request arrives within the cooldown window, the daemon returns **429 Too Many Requests** with a `Retry-After` header and a JSON body `{"throttled": true, "remaining_seconds": N, ...}`. Both successful AND failed wake attempts consume the window — a kiosk with sshd refusing connections doesn't get hammered by HA retries.
 
 The env file is loaded by systemd (`EnvironmentFile=`) and read by the daemon at request time. Passwords are never stored in the YAML config — only the env var name is there.
 

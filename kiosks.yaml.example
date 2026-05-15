@@ -14,6 +14,13 @@ kiosks:
     ssh_password_env: WALLACH_SSH_PASSWORD
     devtools_port: 9222
 
+    # Optional: per-kiosk cooldown (seconds) between /kiosk-wake or
+    # /kiosk-sleep requests. Protects the kiosk's sshd from runaway HA
+    # motion-wake automations. Failed wake attempts still consume the
+    # window. Falls back to KIOSK_WAKE_COOLDOWN_SECONDS env var (default 30s).
+    # Set to 0 to disable for this kiosk.
+    # wake_cooldown_seconds: 30
+
     # Canonical URL for /kiosk-reset (the "home" state). Used by HA's
     # motion-wake automation to revert the kiosk after sleep.
     kiosk_url: "https://loft-dashboard.k8s.inxaos.com"

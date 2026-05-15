@@ -56,6 +56,12 @@ TOKEN = os.environ.get("KIOSK_CONTROLLER_TOKEN", "")
 PORT = int(os.environ.get("KIOSK_CONTROLLER_PORT", "18080"))
 HOST = os.environ.get("KIOSK_CONTROLLER_HOST", "0.0.0.0")
 
+# Default cooldown (seconds) between successive /kiosk-wake or /kiosk-sleep
+# requests for the same kiosk. Prevents HA motion-wake automation runaway
+# loops from DDoSing the kiosk's sshd. Per-kiosk override available via
+# `wake_cooldown_seconds` in kiosks.yaml. Set to 0 to disable globally.
+WAKE_COOLDOWN_SECONDS = float(os.environ.get("KIOSK_WAKE_COOLDOWN_SECONDS", "30"))
+
 
 def load_kiosks() -> dict[str, Any]:
     """Load kiosks.yaml and return the kiosks dict. Re-read each request so
@@ -75,6 +81,80 @@ def load_kiosks() -> dict[str, Any]:
 def get_kiosk(name: str) -> dict[str, Any] | None:
     kiosks = load_kiosks()
     return kiosks.get(name)
+
+
+# ---------------------------------------------------------------------------
+# Wake/sleep rate-limit state
+# ---------------------------------------------------------------------------
+# Maps kiosk_name -> monotonic timestamp of the last wake or sleep attempt
+# (successful OR failed). Failed attempts still count, so a wedged kiosk
+# doesn't get hammered with retry traffic from HA motion sensors. State is
+# in-memory and resets on daemon restart — acceptable because the daemon
+# itself is stateless and a restart implies operator intent.
+_last_dpms_attempt: dict[str, float] = {}
+
+
+def _cooldown_for(kiosk: dict[str, Any]) -> float:
+    """Return the cooldown window (seconds) for this kiosk.
+
+    Per-kiosk `wake_cooldown_seconds` in kiosks.yaml overrides the global
+    KIOSK_WAKE_COOLDOWN_SECONDS env var. A value of 0 disables the guard.
+    """
+    override = kiosk.get("wake_cooldown_seconds")
+    if override is None:
+        return WAKE_COOLDOWN_SECONDS
+    try:
+        return float(override)
+    except (TypeError, ValueError):
+        log.warning(
+            "Invalid wake_cooldown_seconds=%r for kiosk; falling back to default %ss",
+            override, WAKE_COOLDOWN_SECONDS,
+        )
+        return WAKE_COOLDOWN_SECONDS
+
+
+def _check_dpms_cooldown(name: str, kiosk: dict[str, Any]) -> web.Response | None:
+    """Return a 429 response if `name` is inside its cooldown window, else None.
+
+    Records the attempt timestamp as a side-effect when allowing through, so
+    the next call within `cooldown` seconds is throttled. Failed-but-attempted
+    requests still consume the window — see module-level note on why.
+    """
+    cooldown = _cooldown_for(kiosk)
+    if cooldown <= 0:
+        return None
+
+    now = time.monotonic()
+    last = _last_dpms_attempt.get(name)
+    if last is not None:
+        elapsed = now - last
+        if elapsed < cooldown:
+            remaining = round(cooldown - elapsed, 1)
+            log.info(
+                "throttled kiosk=%s remaining=%.1fs cooldown=%.1fs",
+                name, remaining, cooldown,
+            )
+            return web.json_response(
+                {
+                    "throttled": True,
+                    "kiosk": name,
+                    "remaining_seconds": remaining,
+                    "cooldown_seconds": cooldown,
+                    "message": (
+                        f"kiosk={name} is in cooldown; wait {remaining}s before retrying"
+                    ),
+                },
+                status=429,
+                headers={"Retry-After": str(int(remaining) + 1)},
+            )
+
+    _last_dpms_attempt[name] = now
+    return None
+
+
+def _reset_dpms_cooldown_state() -> None:
+    """Test helper: wipe the in-memory cooldown state."""
+    _last_dpms_attempt.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +518,10 @@ async def handle_sleep(request: web.Request) -> web.Response:
     if not kiosk:
         return web.json_response({"error": f"unknown kiosk: {name}"}, status=404)
 
+    throttled = _check_dpms_cooldown(name, kiosk)
+    if throttled is not None:
+        return throttled
+
     log.info("sleep request for kiosk=%s", name)
     try:
         exit_status, stdout, stderr = await _ssh_exec(kiosk, SLEEP_COMMAND)
@@ -479,6 +563,10 @@ async def handle_wake(request: web.Request) -> web.Response:
     kiosk = get_kiosk(name)
     if not kiosk:
         return web.json_response({"error": f"unknown kiosk: {name}"}, status=404)
+
+    throttled = _check_dpms_cooldown(name, kiosk)
+    if throttled is not None:
+        return throttled
 
     log.info("wake request for kiosk=%s", name)
     try:
